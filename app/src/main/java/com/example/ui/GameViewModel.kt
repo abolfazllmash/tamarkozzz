@@ -10,6 +10,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.*
 import com.example.game.*
+import com.example.network.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import java.util.UUID
@@ -39,10 +40,94 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
     val repository = GameRepository(db)
     val synthesizer = GameSoundSynthesizer()
 
-    val activeBuyCoinPack = MutableStateFlow<CoinPack?>(null)
-
     // Preferences for Level HighScores
     private val prefs = application.getSharedPreferences("avoid_blocks_prefs", Context.MODE_PRIVATE)
+
+    // ---- ورود و همگام‌سازی با سرور ----
+    private val authManager = AuthManager(application)
+    val isLoggedIn = MutableStateFlow(authManager.hasToken())
+    val isLoggingIn = MutableStateFlow(false)
+    val loginError = MutableStateFlow<String?>(null)
+
+    private fun serverToEntity(sp: ServerProfile): UserProfileEntity = UserProfileEntity(
+        id = 1,
+        level = sp.level,
+        xp = sp.xp,
+        coins = sp.coins,
+        stars = sp.stars,
+        focusPoints = sp.focusPoints,
+        streak = sp.streak,
+        lastLoginTime = sp.lastLoginTime,
+        equippedSkin = sp.equippedSkin,
+        unlockedSkins = sp.unlockedSkins,
+        equippedAbility = sp.equippedAbility,
+        unlockedAbilities = sp.unlockedAbilities,
+        upgradesString = sp.upgradesString
+    )
+
+    private fun entityToServer(e: UserProfileEntity): ServerProfile = ServerProfile(
+        level = e.level,
+        xp = e.xp,
+        coins = e.coins,
+        stars = e.stars,
+        focusPoints = e.focusPoints,
+        streak = e.streak,
+        lastLoginTime = e.lastLoginTime,
+        equippedSkin = e.equippedSkin,
+        unlockedSkins = e.unlockedSkins,
+        equippedAbility = e.equippedAbility,
+        unlockedAbilities = e.unlockedAbilities,
+        upgradesString = e.upgradesString
+    )
+
+    fun guestLogin() {
+        if (isLoggingIn.value) return
+        isLoggingIn.value = true
+        loginError.value = null
+        viewModelScope.launch {
+            try {
+                val resp = ApiClient.service.guestLogin(GuestLoginRequest(authManager.deviceId))
+                if (resp.ok && !resp.token.isNullOrEmpty()) {
+                    authManager.token = resp.token
+                    authManager.userId = resp.userId ?: 0L
+                    resp.profile?.let { repository.updateProfile(serverToEntity(it)) }
+                    isLoggedIn.value = true
+                } else {
+                    loginError.value = "ورود کامل نشد، دوباره امتحان کن!"
+                }
+            } catch (e: java.io.IOException) {
+                // مشکل اینترنت/اتصال
+                loginError.value = "حواس اینترنت پرته! بررسیش کن!"
+            } catch (e: Exception) {
+                // خطای سمت سرور یا هر چیز دیگر
+                loginError.value = "حواس‌پرتی از سمت سروره! دوباره امتحان کن!"
+            } finally {
+                isLoggingIn.value = false
+            }
+        }
+    }
+
+    // خواندن پیشرفت از سرور (هنگام شروع برنامه)
+    fun pullProfile() {
+        if (!authManager.hasToken()) return
+        viewModelScope.launch {
+            try {
+                val resp = ApiClient.service.getProfile(authManager.bearer())
+                if (resp.ok) resp.profile?.let { repository.updateProfile(serverToEntity(it)) }
+            } catch (_: Exception) { }
+        }
+    }
+
+    // ذخیره‌ی پیشرفت روی سرور (هنگام خروج/توقف)
+    fun pushProfile() {
+        if (!authManager.hasToken()) return
+        viewModelScope.launch {
+            try {
+                val e = repository.getProfileDirect()
+                ApiClient.service.saveProfile(authManager.bearer(), SaveProfileRequest(entityToServer(e)))
+            } catch (_: Exception) { }
+        }
+    }
 
     // Exposed Flows from DB
     val userProfile: StateFlow<UserProfileEntity?> = repository.userProfile
@@ -71,6 +156,7 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
 
     fun isLevelUnlocked(lvl: Int): Boolean {
         if (lvl == 1) return true
+        if (prefs.getBoolean("level_purchased_$lvl", false)) return true
         val prevLvl = lvl - 1
         val prevTarget = DynamicLevelConfig.generate(prevLvl).survivalTargetSecs
         val prevHighScore = getHighScoreForLevel(prevLvl)
@@ -243,26 +329,23 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    // ---- خرید بسته‌ی سکه (شبیه‌سازی‌شده؛ هنوز پرداخت واقعی نیست) ----
+    val activeBuyCoinPack = MutableStateFlow<CoinPack?>(null)
+
+    fun buyCoinsSimulated(coins: Int) {
+        viewModelScope.launch {
+            repository.incrementCoins(coins)
+        }
+    }
+
+    // ---- مدیریت دکمه بازگشت گوشی ----
     fun handleBackPress() {
         when (currentScreen.value) {
-            TrialScreen.LevelSelect,
-            TrialScreen.Upgrades,
-            TrialScreen.Achievements,
-            TrialScreen.Quests -> {
-                navigateTo(TrialScreen.Menu)
-            }
             TrialScreen.Gameplay -> {
-                // خروج از گیم‌پلی و برگشتن به لیست مراحل
                 gameLoopJob?.cancel()
                 navigateTo(TrialScreen.LevelSelect)
             }
-            TrialScreen.GameOver,
-            TrialScreen.GameSuccess -> {
-                navigateTo(TrialScreen.LevelSelect)
-            }
-            TrialScreen.Menu -> {
-                // در منوی اصلی، با بک زدن خارج می‌شود
-            }
+            else -> navigateTo(TrialScreen.Menu)
         }
     }
 
@@ -350,19 +433,26 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             val current = repository.getProfileDirect()
             val currentLvl = current.getUpgradeLevel(key)
-            if (currentLvl >= 3) return@launch // maxed at 3 levels
+            if (currentLvl >= 3) return@launch // حداکثر ۳ سطح
             val cost = current.getUpgradeCost(key)
+            if (cost <= 0) return@launch
             if (current.coins >= cost) {
-                // Update upgrade dictionary
-                val upgrades = current.upgradesString.split(",")
-                    .map { it.split(":") }
-                    .map {
-                        if (it[0] == key) "$key:${currentLvl + 1}" else "${it[0]}:${it[1]}"
-                    }.joinToString(",")
+                // ساخت نقشه‌ی ارتقاها از رشته‌ی فعلی
+                val map = LinkedHashMap<String, Int>()
+                current.upgradesString.split(",").forEach { pair ->
+                    val parts = pair.split(":")
+                    if (parts.size == 2) {
+                        val lvl = parts[1].toIntOrNull() ?: 0
+                        map[parts[0]] = lvl
+                    }
+                }
+                // افزایش سطح کلید موردنظر (حتی اگر قبلاً نبود، اضافه می‌شود)
+                map[key] = (map[key] ?: 0) + 1
 
+                val updatedString = map.entries.joinToString(",") { "${it.key}:${it.value}" }
                 val updated = current.copy(
                     coins = current.coins - cost,
-                    upgradesString = upgrades
+                    upgradesString = updatedString
                 )
                 repository.updateProfile(updated)
                 synthesizer.playSuccess()
@@ -377,13 +467,6 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
             repository.incrementCoins(amount)
             showDailyRewardDialog.value = false
             synthesizer.playCollectCoin()
-        }
-    }
-
-    fun buyCoinsSimulated(amount: Int) {
-        viewModelScope.launch {
-            repository.incrementCoins(amount)
-            synthesizer.playSuccess()
         }
     }
 
@@ -413,7 +496,7 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
         when (abilityId) {
             "shield" -> {
                 val profile = userProfile.value ?: return
-                val durationBonus = profile.getUpgradeLevel("shield_duration") * 1.0f
+                val durationBonus = profile.getUpgradeLevel("shield_duration") * 0.8f
                 shieldTimeLeft.value = 4.0f + durationBonus
                 shieldCooldown.value = 12.0f
                 synthesizer.playSavingAbility()
@@ -441,9 +524,7 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
             "time_slow" -> {
-                val profile = userProfile.value
-                val durationBonus = (profile?.getUpgradeLevel("slow_mo_duration") ?: 0) * 1.0f
-                slowMoTimeLeft.value = 4.0f + durationBonus
+                slowMoTimeLeft.value = 4.0f
                 slowMoCooldown.value = 15.0f
                 synthesizer.playSavingAbility()
                 spawnVibrantBurst(Offset(500f, 500f), 0xFFE2E2E2.toInt())
@@ -815,29 +896,20 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
         var finalPx = nPx
         var finalPy = nPy
 
-        val isInvincible = shieldTimeLeft.value > 0f || ghostTimeLeft.value > 0f
-        var hitBorder = false
-        if (nPx < minX || nPx > maxX || nPy < minY || nPy > maxY) {
-            hitBorder = true
+        if (finalPx < minX) {
+            finalPx = minX
+            playerVelX = -playerVelX * 0.7f // elastic normal wall reflection
+        } else if (finalPx > maxX) {
+            finalPx = maxX
+            playerVelX = -playerVelX * 0.7f
         }
 
-        if (hitBorder) {
-            if (isInvincible) {
-                if (shieldTimeLeft.value > 0f) {
-                    shieldTimeLeft.value = 0f
-                    ghostTimeLeft.value = 1.0f
-                    synthesizer.playFailure()
-                    spawnVibrantBurst(pOffset, 0xFFE2E2E2.toInt())
-                    screenShakeAmount.value = 12f
-                }
-                finalPx = nPx.coerceIn(minX, maxX)
-                finalPy = nPy.coerceIn(minY, maxY)
-                playerVelX = -playerVelX * 0.7f
-                playerVelY = -playerVelY * 0.7f
-            } else {
-                triggerDeathSequence()
-                return
-            }
+        if (finalPy < minY) {
+            finalPy = minY
+            playerVelY = -playerVelY * 0.7f
+        } else if (finalPy > maxY) {
+            finalPy = maxY
+            playerVelY = -playerVelY * 0.7f
         }
 
         playerPos.value = Offset(finalPx, finalPy)
@@ -1024,8 +1096,8 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
         }
         orbs.value = curOrbs
 
-        // 6. Spawn new collectibles periodically (halved the frequency and max active count)
-        if (frameCount % 360 == 0 && orbs.value.size < 3) {
+        // 6. Spawn new collectibles periodically
+        if (frameCount % 180 == 0 && orbs.value.size < 5) {
             spawnOrbsBatch()
         }
 
@@ -1063,7 +1135,7 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun spawnOrbsBatch() {
         val rand = Random.Default
-        val num = 1
+        val num = if (currentArenaRadius.value > 450f) 2 else 1
         val list = orbs.value.toMutableList()
 
         val profile = userProfile.value
@@ -1076,13 +1148,13 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
             val ox = (500f + Math.cos(angle) * dist).toFloat()
             val oy = (500f + Math.sin(angle) * dist).toFloat()
 
-            // Random Type selective (Excluding Coins so players only earn coins by winning stages)
+            // Random Type selective — بدون سکه؛ فقط قابلیت‌ها ظاهر می‌شوند
             val dice = rand.nextFloat()
             val type = when {
-                dice < 0.25f -> OrbType.SHIELD
-                dice < 0.50f -> OrbType.MAGNET
-                dice < 0.75f -> OrbType.SLOW_MO
-                else -> OrbType.SPEED_BOOST
+                dice < 0.35f -> OrbType.SLOW_MO
+                dice < 0.70f -> OrbType.SPEED_BOOST
+                dice < 0.70f + shieldMagnChance -> OrbType.SHIELD
+                else -> OrbType.MAGNET
             }
 
             list.add(
@@ -1197,7 +1269,7 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
             }
             OrbType.SHIELD -> {
                 synthesizer.playSavingAbility()
-                val bonus = (profile?.getUpgradeLevel("shield_duration") ?: 0) * 1.0f
+                val bonus = (profile?.getUpgradeLevel("shield_duration") ?: 0) * 0.8f
                 shieldTimeLeft.value = 4.0f + bonus
                 // بدون عبارت بالای صفحه (طبق درخواست)
                 colorHex = 0xFF00D2FF.toInt()
@@ -1209,8 +1281,7 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
             }
             OrbType.SLOW_MO -> {
                 synthesizer.playSavingAbility()
-                val bonus = (profile?.getUpgradeLevel("slow_mo_duration") ?: 0) * 1.0f
-                slowMoTimeLeft.value = 4.0f + bonus
+                slowMoTimeLeft.value = 4.0f
                 colorHex = 0xFFE2E2E2.toInt()
             }
             OrbType.MAGNET -> {
