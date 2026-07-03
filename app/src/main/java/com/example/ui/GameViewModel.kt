@@ -896,6 +896,13 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
         var finalPx = nPx
         var finalPy = nPy
 
+        // برخورد با کادر (دیواره‌ی زمین) باعث باخت می‌شود، مگر با سپر/شبح
+        val hitWall = nPx < minX || nPx > maxX || nPy < minY || nPy > maxY
+        val invincibleNow = shieldTimeLeft.value > 0f || ghostTimeLeft.value > 0f
+        if (hitWall && !invincibleNow) {
+            triggerDeathSequence()
+        }
+
         if (finalPx < minX) {
             finalPx = minX
             playerVelX = -playerVelX * 0.7f // elastic normal wall reflection
@@ -1096,8 +1103,8 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
         }
         orbs.value = curOrbs
 
-        // 6. Spawn new collectibles periodically
-        if (frameCount % 180 == 0 && orbs.value.size < 5) {
+        // 6. Spawn new collectibles periodically (نرخ به ۳/۴ کاهش یافت)
+        if (frameCount % 240 == 0 && orbs.value.size < 5) {
             spawnOrbsBatch()
         }
 
