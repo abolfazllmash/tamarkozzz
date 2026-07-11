@@ -10,7 +10,6 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.*
 import com.example.game.*
-import com.example.network.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import java.util.UUID
@@ -43,90 +42,15 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
     // Preferences for Level HighScores
     private val prefs = application.getSharedPreferences("avoid_blocks_prefs", Context.MODE_PRIVATE)
 
-    // ---- ورود و همگام‌سازی با سرور ----
-    private val authManager = AuthManager(application)
-    val isLoggedIn = MutableStateFlow(authManager.hasToken())
+    // ---- ورود کاملاً لوکال (فقط اولین اجرا) ----
+    // هیچ ارتباطی با سرور نیست؛ همه‌چیز روی خود دستگاه ذخیره می‌شود.
+    val isLoggedIn = MutableStateFlow(prefs.getBoolean("has_entered", false))
     val isLoggingIn = MutableStateFlow(false)
     val loginError = MutableStateFlow<String?>(null)
 
-    private fun serverToEntity(sp: ServerProfile): UserProfileEntity = UserProfileEntity(
-        id = 1,
-        level = sp.level,
-        xp = sp.xp,
-        coins = sp.coins,
-        stars = sp.stars,
-        focusPoints = sp.focusPoints,
-        streak = sp.streak,
-        lastLoginTime = sp.lastLoginTime,
-        equippedSkin = sp.equippedSkin,
-        unlockedSkins = sp.unlockedSkins,
-        equippedAbility = sp.equippedAbility,
-        unlockedAbilities = sp.unlockedAbilities,
-        upgradesString = sp.upgradesString
-    )
-
-    private fun entityToServer(e: UserProfileEntity): ServerProfile = ServerProfile(
-        level = e.level,
-        xp = e.xp,
-        coins = e.coins,
-        stars = e.stars,
-        focusPoints = e.focusPoints,
-        streak = e.streak,
-        lastLoginTime = e.lastLoginTime,
-        equippedSkin = e.equippedSkin,
-        unlockedSkins = e.unlockedSkins,
-        equippedAbility = e.equippedAbility,
-        unlockedAbilities = e.unlockedAbilities,
-        upgradesString = e.upgradesString
-    )
-
     fun guestLogin() {
-        if (isLoggingIn.value) return
-        isLoggingIn.value = true
-        loginError.value = null
-        viewModelScope.launch {
-            try {
-                val resp = ApiClient.service.guestLogin(GuestLoginRequest(authManager.deviceId))
-                if (resp.ok && !resp.token.isNullOrEmpty()) {
-                    authManager.token = resp.token
-                    authManager.userId = resp.userId ?: 0L
-                    resp.profile?.let { repository.updateProfile(serverToEntity(it)) }
-                    isLoggedIn.value = true
-                } else {
-                    loginError.value = "ورود کامل نشد، دوباره امتحان کن!"
-                }
-            } catch (e: java.io.IOException) {
-                // مشکل اینترنت/اتصال
-                loginError.value = "حواس اینترنت پرته! بررسیش کن!"
-            } catch (e: Exception) {
-                // خطای سمت سرور یا هر چیز دیگر
-                loginError.value = "حواس‌پرتی از سمت سروره! دوباره امتحان کن!"
-            } finally {
-                isLoggingIn.value = false
-            }
-        }
-    }
-
-    // خواندن پیشرفت از سرور (هنگام شروع برنامه)
-    fun pullProfile() {
-        if (!authManager.hasToken()) return
-        viewModelScope.launch {
-            try {
-                val resp = ApiClient.service.getProfile(authManager.bearer())
-                if (resp.ok) resp.profile?.let { repository.updateProfile(serverToEntity(it)) }
-            } catch (_: Exception) { }
-        }
-    }
-
-    // ذخیره‌ی پیشرفت روی سرور (هنگام خروج/توقف)
-    fun pushProfile() {
-        if (!authManager.hasToken()) return
-        viewModelScope.launch {
-            try {
-                val e = repository.getProfileDirect()
-                ApiClient.service.saveProfile(authManager.bearer(), SaveProfileRequest(entityToServer(e)))
-            } catch (_: Exception) { }
-        }
+        prefs.edit().putBoolean("has_entered", true).apply()
+        isLoggedIn.value = true
     }
 
     // Exposed Flows from DB
